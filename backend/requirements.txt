@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+structlog
+pydantic
+pydantic-settings
+python-dotenv
+langchain
+langgraph
+langchain-openai
+langchain-community
+pinecone
+rank_bm25
+pytest

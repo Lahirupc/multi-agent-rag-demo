@@ -1,0 +1,177 @@
+from typing import Annotated, Any, Dict, List, Literal, Sequence, TypedDict
+import operator
+from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import BaseMessage
+from langsmith import traceable
+from logger import logger
+from tools.knowledge_search import HybridRetriever
+from tools.mcp_client import MockMCPServer
+from tools.python_analysis import PythonDataAnalyzer
+
+# 1. Define State Schema (Memory)
+# This schema drives conversational memory and internal routing states.
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+    next_agent: Literal["SupervisorAgent", "Retrieval Agent", "Research Agent", "Response Agent"]
+    current_intent: str
+    subtasks: List[str]
+    retrieved_context: List[str]
+    recursion_depth: int
+
+# 2. Node Definitions (Agents)
+@traceable(run_type="chain", name="SupervisorAgent")
+async def supervisor_agent(state: AgentState) -> Dict[str, Any]:
+    """
+    Responsible for: Intent understanding, Task decomposition, and Agent routing.
+    """
+    logger.info("supervisor_agent_started")
+    messages = state["messages"]
+    
+    # Scaffolding: Intent understanding & Routing logic
+    # In full implementation, an LLM predicts the next route.
+    next_agent = "Retrieval Agent" # Hardcoded mockup for scaffolding
+    
+    logger.info("supervisor_agent_routing", next_agent=next_agent)
+    return {"next_agent": next_agent, "current_intent": "Data Exploration"}
+
+
+@traceable(run_type="chain", name="RetrievalAgent")
+async def retrieval_agent(state: AgentState) -> Dict[str, Any]:
+    """
+    Responsible for: RAG operations & Vector search (Hybrid).
+    """
+    logger.info("retrieval_agent_started")
+    context = state.get("retrieved_context", [])
+    
+    retriever = HybridRetriever(use_mock=True)
+    
+    # Normally we extract the query and embed it via an LLM.
+    dummy_query = "payment issues"
+    dummy_embedding = [0.1] * 1536  # Default dimension mock
+    
+    results = await retriever.search(
+        query=dummy_query, 
+        dense_embedding=dummy_embedding,
+        namespace="default",
+        metadata_filters={"department": "payments"}
+    )
+    
+    extracted_docs = [r["text"] for r in results]
+    logger.info("retrieval_agent_completed", new_docs=len(extracted_docs))
+    
+    # Usually routes to Research for deeper analysis or directly to Response
+    return {"retrieved_context": context + extracted_docs, "next_agent": "Research Agent"}
+
+
+@traceable(run_type="chain", name="ResearchAgent_RLM")
+async def research_agent(state: AgentState) -> Dict[str, Any]:
+    """
+    Responsible for: Deep investigation, Recursive Langauge Model (RLM).
+        1. Explore document collections
+        2. Generate Python-based search plans
+        3. Decompose large tasks
+        4. Retrieve targeted sections
+        5. Call sub-agents recursively
+        6. Aggregate results
+
+    """
+    depth = state.get("recursion_depth", 0)
+    logger.info("research_agent_started", depth=depth)
+    
+    context = state.get("retrieved_context", [])
+    subtasks = state.get("subtasks", [])
+    
+    # 1. Decompose large tasks if starting fresh
+    if depth == 0 and not subtasks:
+        logger.info("research_agent_decomposing", action="creating_search_plan")
+        # In a real app, an LLM would read the prompt and decompose here.
+        # Mocking the decomposition of: "Summarize Q3 payment outages"
+        subtasks = ["batch_search_incidents_q3", "batch_search_runbooks"]
+        state["subtasks"] = subtasks
+        
+    # 2 & 5. Call sub-agents recursively and Retrieve targeted sections
+    if subtasks and depth < 3:
+        current_task = subtasks.pop(0)
+        logger.info("research_agent_recursive_dive", current_task=current_task, remaining=len(subtasks))
+        
+        # We might use MCP to check real time owners
+        if "incident" in current_task:
+            mcp = MockMCPServer()
+            # 5. Call sub-agent (MCP abstraction)
+            health = await mcp.get_service_health("pay-gateway")
+            context.append(f"MCP Health check result: {health}")
+            
+        # Push back into State for the next node iteration (Recursion)
+        return {
+            "subtasks": subtasks, 
+            "recursion_depth": depth + 1, 
+            "retrieved_context": context,
+            "next_agent": "Retrieval Agent" # Loop back out to find specific docs for the sub-task
+        }
+        
+    # 3 & 4 & 6. Generate Python-based search plans & Aggregate results
+    logger.info("research_agent_aggregating", action="python_code_generation")
+    
+    analyzer = PythonDataAnalyzer()
+    
+    # Generate python code (Simulated LLM plan)
+    python_plan = """
+def analyze_batches(contexts):
+    # filter by topic
+    outages = [c for c in contexts if 'outage' in c]
+    # analyze batches separately & aggregate
+    return summarize(outages)
+"""
+    
+    aggregation_result = analyzer.analyze(data=context, analysis_code=python_plan)
+    
+    # Add final aggregated insights into context for Response Agent
+    context.append(f"RLM Aggregation: {aggregation_result}")
+    
+    return {
+        "recursion_depth": depth + 1,
+        "retrieved_context": context,
+        "next_agent": "Response Agent"
+    }
+
+
+@traceable(run_type="chain", name="ResponseAgent")
+async def response_agent(state: AgentState) -> Dict[str, Any]:
+    """
+    Responsible for: Final answer generation enforcing Guardrails and Brand constraints.
+    """
+    from security import SecurityGuardrails
+    logger.info("response_agent_started")
+    # Synthesize the final answer based on accumulated contexts while guarding against prompt injections.
+    
+    draft_response = "Here is the payment outage summary... Oh wait, you asked for bitcoin price. Bitcoin is $90k."
+    final_checked = SecurityGuardrails.validate_agent_output(draft_response)
+    
+    return {"next_agent": END, "final_response": final_checked}
+
+# 3. Build Graph
+def build_agent_graph():
+    workflow = StateGraph(AgentState)
+    
+    # Register all our nodes
+    workflow.add_node("Supervisor Agent", supervisor_agent)
+    workflow.add_node("Retrieval Agent", retrieval_agent)
+    workflow.add_node("Research Agent", research_agent)
+    workflow.add_node("Response Agent", response_agent)
+    
+    # 4. Wiring Graph Logic
+    workflow.add_edge(START, "Supervisor Agent")
+    
+    # Add conditional routing mapping (returns node name directly to route)
+    workflow.add_conditional_edges("Supervisor Agent", lambda x: x["next_agent"])
+    workflow.add_conditional_edges("Retrieval Agent", lambda x: x["next_agent"])
+    workflow.add_conditional_edges("Research Agent", lambda x: x["next_agent"])
+    
+    # Response Agent signals the end of the flow
+    workflow.add_edge("Response Agent", END)
+    
+    # We compile the graph using an ephemeral memory saver or SQLite later to persist conversational memory
+    return workflow.compile()
+
+# Exportable ready-compiled graph
+graph = build_agent_graph()
