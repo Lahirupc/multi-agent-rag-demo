@@ -7,6 +7,7 @@ from logger import logger
 from tools.knowledge_search import HybridRetriever
 from tools.mcp_client import MockMCPServer
 from tools.python_analysis import PythonDataAnalyzer
+from langchain_openrouter import ChatOpenRouter
 
 # 1. Define State Schema (Memory)
 # This schema drives conversational memory and internal routing states.
@@ -29,7 +30,40 @@ async def supervisor_agent(state: AgentState) -> Dict[str, Any]:
     
     # Scaffolding: Intent understanding & Routing logic
     # In full implementation, an LLM predicts the next route.
-    next_agent = "Retrieval Agent" # Hardcoded mockup for scaffolding
+    
+    llm = ChatOpenRouter(model="inclusionai/ling-3.0-flash-fin:free", temperature=0)
+    
+    
+    messages = [
+        (
+            "system",
+             """You are a supervisor agent. You decide the user intent and does the agent routing. There are other agents named such as
+                    
+                "SupervisorAgent", "Retrieval Agent", "Research Agent" and "Response Agent". 
+                
+                Retrieval Agent
+                    Responsible for:
+                    ● RAG operations
+                    ● Vector search
+                Research Agent
+                    Responsible for:
+                    ● Deep investigation
+                    ● Recursive exploration
+                Response Agent
+                    Responsible for:
+                    ● Final answer generation
+                    
+                Make sure to name only one agent for the next action.
+                """,
+        ),
+        ("human", state.messages),
+    ]
+   
+    # structured output
+    structured_model = llm.with_structured_output(TextResponse, method="json_mode")
+    
+    
+    # next_agent = "Retrieval Agent" # Hardcoded mockup for scaffolding
     
     logger.info("supervisor_agent_routing", next_agent=next_agent)
     return {"next_agent": next_agent, "current_intent": "Data Exploration"}

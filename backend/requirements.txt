@@ -8,6 +8,7 @@ langchain
 langgraph
 langchain-openai
 langchain-community
+langchain_openrouter
 pinecone
 rank_bm25
 pytest
