@@ -64,7 +64,7 @@ async def supervisor_agent(state: AgentState) -> Dict[str, Any]:
     ]
 
     # structured output
-    structured_model = llm.with_structured_output(RouteDecision, method="json_mode")
+    structured_model = llm.with_structured_output(RouteDecision, method="json_schema")
     decision = await structured_model.ainvoke(routing_messages)
 
     logger.info("supervisor_agent_routing", next_agent=decision.next_agent)
@@ -92,10 +92,13 @@ async def retrieval_agent(state: AgentState) -> Dict[str, Any]:
         metadata_filters={"department": "payments"}
     )
     
-    extracted_docs = [r["text"] for r in results]
+    # This loop is re-entered once per subtask (see research_agent), and since the
+    # query is currently the same hardcoded string each time, dedupe against what's
+    # already been collected so identical docs aren't appended repeatedly.
+    existing = set(context)
+    extracted_docs = [r["text"] for r in results if r["text"] not in existing]
     logger.info("retrieval_agent_completed", new_docs=len(extracted_docs))
-    
-    # Usually routes to Research for deeper analysis or directly to Response
+
     return {"retrieved_context": context + extracted_docs, "next_agent": "Research Agent"}
 
 
