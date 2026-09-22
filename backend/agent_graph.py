@@ -3,7 +3,9 @@ import operator
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import BaseMessage
 from langsmith import traceable
+from pydantic import BaseModel
 from logger import logger
+from security import SecurityGuardrails
 from tools.knowledge_search import HybridRetriever
 from tools.mcp_client import MockMCPServer
 from tools.python_analysis import PythonDataAnalyzer
@@ -13,11 +15,18 @@ from langchain_openrouter import ChatOpenRouter
 # This schema drives conversational memory and internal routing states.
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
-    next_agent: Literal["SupervisorAgent", "Retrieval Agent", "Research Agent", "Response Agent"]
+    next_agent: Literal["Supervisor Agent", "Retrieval Agent", "Research Agent", "Response Agent"]
     current_intent: str
     subtasks: List[str]
     retrieved_context: List[str]
     recursion_depth: int
+    final_response: str
+
+
+class RouteDecision(BaseModel):
+    """Structured output schema for the supervisor's routing decision."""
+    next_agent: Literal["Retrieval Agent", "Research Agent", "Response Agent"]
+    current_intent: str
 
 # 2. Node Definitions (Agents)
 @traceable(run_type="chain", name="SupervisorAgent")
@@ -26,21 +35,16 @@ async def supervisor_agent(state: AgentState) -> Dict[str, Any]:
     Responsible for: Intent understanding, Task decomposition, and Agent routing.
     """
     logger.info("supervisor_agent_started")
-    messages = state["messages"]
-    
-    # Scaffolding: Intent understanding & Routing logic
-    # In full implementation, an LLM predicts the next route.
-    
+
     llm = ChatOpenRouter(model="inclusionai/ling-3.0-flash-fin:free", temperature=0)
-    
-    
-    messages = [
+
+    routing_messages = [
         (
             "system",
              """You are a supervisor agent. You decide the user intent and does the agent routing. There are other agents named such as
-                    
-                "SupervisorAgent", "Retrieval Agent", "Research Agent" and "Response Agent". 
-                
+
+                "Supervisor Agent", "Retrieval Agent", "Research Agent" and "Response Agent".
+
                 Retrieval Agent
                     Responsible for:
                     ● RAG operations
@@ -52,21 +56,19 @@ async def supervisor_agent(state: AgentState) -> Dict[str, Any]:
                 Response Agent
                     Responsible for:
                     ● Final answer generation
-                    
+
                 Make sure to name only one agent for the next action.
                 """,
         ),
-        ("human", state.messages),
+        *state["messages"],
     ]
-   
+
     # structured output
-    structured_model = llm.with_structured_output(TextResponse, method="json_mode")
-    
-    
-    # next_agent = "Retrieval Agent" # Hardcoded mockup for scaffolding
-    
-    logger.info("supervisor_agent_routing", next_agent=next_agent)
-    return {"next_agent": next_agent, "current_intent": "Data Exploration"}
+    structured_model = llm.with_structured_output(RouteDecision, method="json_mode")
+    decision = await structured_model.ainvoke(routing_messages)
+
+    logger.info("supervisor_agent_routing", next_agent=decision.next_agent)
+    return {"next_agent": decision.next_agent, "current_intent": decision.current_intent}
 
 
 @traceable(run_type="chain", name="RetrievalAgent")
@@ -112,8 +114,9 @@ async def research_agent(state: AgentState) -> Dict[str, Any]:
     depth = state.get("recursion_depth", 0)
     logger.info("research_agent_started", depth=depth)
     
-    context = state.get("retrieved_context", [])
-    subtasks = state.get("subtasks", [])
+    # Copy rather than alias: nodes must not mutate the incoming state's containers in place.
+    context = list(state.get("retrieved_context", []))
+    subtasks = list(state.get("subtasks", []))
     
     # 1. Decompose large tasks if starting fresh
     if depth == 0 and not subtasks:
@@ -121,8 +124,7 @@ async def research_agent(state: AgentState) -> Dict[str, Any]:
         # In a real app, an LLM would read the prompt and decompose here.
         # Mocking the decomposition of: "Summarize Q3 payment outages"
         subtasks = ["batch_search_incidents_q3", "batch_search_runbooks"]
-        state["subtasks"] = subtasks
-        
+
     # 2 & 5. Call sub-agents recursively and Retrieve targeted sections
     if subtasks and depth < 3:
         current_task = subtasks.pop(0)
@@ -174,11 +176,15 @@ async def response_agent(state: AgentState) -> Dict[str, Any]:
     """
     Responsible for: Final answer generation enforcing Guardrails and Brand constraints.
     """
-    from security import SecurityGuardrails
     logger.info("response_agent_started")
-    # Synthesize the final answer based on accumulated contexts while guarding against prompt injections.
-    
-    draft_response = "Here is the payment outage summary... Oh wait, you asked for bitcoin price. Bitcoin is $90k."
+    context = state.get("retrieved_context", [])
+
+    # Synthesize the final answer from accumulated context while guarding against prompt injections.
+    if context:
+        draft_response = "Here is what I found:\n" + "\n".join(f"- {item}" for item in context)
+    else:
+        draft_response = "I could not find relevant information for your request."
+
     final_checked = SecurityGuardrails.validate_agent_output(draft_response)
     
     return {"next_agent": END, "final_response": final_checked}
@@ -196,10 +202,20 @@ def build_agent_graph():
     # 4. Wiring Graph Logic
     workflow.add_edge(START, "Supervisor Agent")
     
-    # Add conditional routing mapping (returns node name directly to route)
-    workflow.add_conditional_edges("Supervisor Agent", lambda x: x["next_agent"])
-    workflow.add_conditional_edges("Retrieval Agent", lambda x: x["next_agent"])
-    workflow.add_conditional_edges("Research Agent", lambda x: x["next_agent"])
+    # Explicit path maps so an unknown/mistyped next_agent value fails at compile time
+    # rather than at first invocation.
+    workflow.add_conditional_edges(
+        "Supervisor Agent",
+        lambda x: x["next_agent"]
+    )
+    workflow.add_conditional_edges(
+        "Retrieval Agent",
+        lambda x: x["next_agent"]
+    )
+    workflow.add_conditional_edges(
+        "Research Agent",
+        lambda x: x["next_agent"]
+    )
     
     # Response Agent signals the end of the flow
     workflow.add_edge("Response Agent", END)
