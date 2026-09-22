@@ -63,9 +63,9 @@ async def chat_endpoint(request: ChatRequest, user: User = Depends(get_current_a
     logger.info("chat_graph_completed", user=user.username)
     
     return {
-        "status": "success", 
+        "status": "success",
         "context_fetched": len(final_state.get("retrieved_context", [])),
-        "response": "This is a strictly compliant response from the Commercial Bank bot (Simulated Orchestration)."
+        "response": final_state.get("final_response", "")
     }
 
 @app.get("/health")
